@@ -59,6 +59,38 @@ function trimLeadingTrailing(line: string): string {
   return line.replace(/^[ \t]*|[ \t]*$/g, '');
 }
 
+function findMatch(
+  pattern: string[],
+  fileLines: string[],
+  startPos: number,
+  tier: number,
+  strict: boolean
+): number | null {
+  if (pattern.length === 0) return null;
+
+  const tierToTry = strict ? [0] : tier === 2 ? [2, 1, 0] : tier === 1 ? [1, 0] : [0];
+
+  for (const t of tierToTry) {
+    const normalize = t === 0 ? (s: string) => s : t === 1 ? trimTrailing : trimLeadingTrailing;
+    const patternNorm = pattern.map(normalize);
+    
+    for (let i = startPos; i <= fileLines.length - pattern.length; i++) {
+      let match = true;
+      for (let j = 0; j < pattern.length; j++) {
+        if (normalize(fileLines[i + j]!) !== patternNorm[j]!) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        return i * 10 + t;
+      }
+    }
+  }
+
+  return null;
+}
+
 function findTierAndMatches(
   pattern: string[],
   fileLines: string[],
@@ -71,7 +103,7 @@ function findTierAndMatches(
   for (const t of tierToTry) {
     const normalize = t === 0 ? (s: string) => s : t === 1 ? trimTrailing : trimLeadingTrailing;
     const patternNorm = pattern.map(normalize);
-
+    
     const positions: number[] = [];
     for (let i = 0; i <= fileLines.length - pattern.length; i++) {
       let match = true;
@@ -85,7 +117,7 @@ function findTierAndMatches(
         positions.push(i);
       }
     }
-
+    
     if (positions.length > 0) {
       return { tier: t, positions };
     }
@@ -267,11 +299,13 @@ function jsonEdits(text: string, lines: string[]): Edit[] {
   return edits;
 }
 
-function parseUnifiedDiff(lines: string[], strict: boolean): Edit[] {
+function parseUnifiedDiff(lines: string[], strict: boolean): { edits: Edit[], moves: Map<string, string> } {
   const edits: Edit[] = [];
+  const moves = new Map<string, string>();
   let i = 0;
 
   while (i < lines.length) {
+    const hunkStart = i;
     let oldPath: string | null = null;
     let newPath: string | null = null;
     let newFileMode = false;
@@ -280,10 +314,10 @@ function parseUnifiedDiff(lines: string[], strict: boolean): Edit[] {
     while (i < lines.length) {
       const l = lines[i]!;
       if (l.startsWith('diff --git ')) {
-        const m = l.match(/^diff --git a\/(.*) b\/(.*)$/);
+        const m = l.match(/^diff --git a\/(.*)b\/(.*)$/);
         if (!m) throw new Exit2(`error: parse ${i + 1}`);
-        oldPath = m[1]!.split('\t')[0]!.trim();
-        newPath = m[2]!.split('\t')[0]!.trim();
+        oldPath = m[1]!.replace(/^a\//, '').split('\t')[0]!.trim();
+        newPath = m[2]!.replace(/^b\//, '').split('\t')[0]!.trim();
         i++;
         break;
       }
@@ -388,7 +422,9 @@ function parseUnifiedDiff(lines: string[], strict: boolean): Edit[] {
         if (tree.get(path) !== null) throw new Fail('exists', path);
         const lines = hunks.flatMap((h) => h.newLines);
         const br = '\n';
-        const text = lines.length === 0 ? '' : lines.join(br) + (hunks.some((h) => !h.noFinalNewline) ? br : '');
+        // Check if any hunk says no final newline; if so, don't add br
+        const hasNoFinalNewline = hunks.some((h) => h.noFinalNewline);
+        const text = lines.length === 0 ? '' : lines.join(br) + (hasNoFinalNewline ? '' : br);
         tree.now.set(path, text);
       });
     } else if (deletedFileMode) {
@@ -397,120 +433,125 @@ function parseUnifiedDiff(lines: string[], strict: boolean): Edit[] {
         tree.now.set(path, null);
       });
     } else if (oldPath !== newPath) {
-      edits.push((tree) => {
-        const oldText = tree.get(oldPath!);
-        if (oldText === null) throw new Fail('missing', oldPath!);
-        if (tree.get(newPath!) !== null) throw new Fail('exists', newPath!);
+       // Track the move explicitly
+       if (oldPath && newPath) {
+         moves.set(oldPath, newPath);
+       }
+       edits.push((tree) => {
+          const oldText = tree.get(oldPath!);
+          if (oldText === null) throw new Fail('missing', oldPath!);
+          if (tree.get(newPath!) !== null) throw new Fail('exists', newPath!);
 
-        let currentLines = fileLines(oldText);
-        const br = fileLineBreak(oldText);
-        let hadFinalBreak = oldText === '' ? false : oldText.endsWith(br);
-        let d = 0;
+          let currentLines = fileLines(oldText);
+          const br = fileLineBreak(oldText);
+          let hadFinalBreak = oldText === '' ? false : oldText.endsWith(br);
+          let d = 0;
 
-        for (const hunk of hunks) {
-          if (hunk.oldLines.length === 0) {
-            const insertPos = Math.min(hunk.oldStart + 1 + d, currentLines.length);
-            currentLines.splice(insertPos, 0, ...hunk.newLines);
-            d += hunk.newLines.length;
-          } else {
-            const target = hunk.oldStart - 1 + d;
-            const matchResult = findMatchNearest(hunk.oldLines, currentLines, target, strict);
-            if (matchResult === null) throw new Fail('no-match', oldPath!);
+          for (const hunk of hunks) {
+            if (hunk.oldLines.length === 0) {
+              const insertPos = Math.min(hunk.oldStart + 1 + d, currentLines.length);
+              currentLines.splice(insertPos, 0, ...hunk.newLines);
+              d += hunk.newLines.length;
+            } else {
+              const target = hunk.oldStart - 1 + d;
+              const matchResult = findMatchNearest(hunk.oldLines, currentLines, target, strict);
+              if (matchResult === null) throw new Fail('no-match', oldPath!);
 
-            const pos = extractPos(matchResult);
-            const tier = extractTier(matchResult);
+              const pos = extractPos(matchResult);
+              const tier = extractTier(matchResult);
 
-            const matched = currentLines.slice(pos, pos + hunk.oldLines.length);
-            const normalize = tier === 0 ? (s: string) => s : tier === 1 ? trimTrailing : trimLeadingTrailing;
-
-            const newLinesWithContext = hunk.newLines.map((line, idx) => {
-              const isContextLine = idx < hunk.oldLines.length && hunk.oldLines[idx]! === line;
-              if (isContextLine) {
-                return matched[idx]!;
-              }
-
-              if (tier === 2 && line !== '' && line.trim() !== '') {
-                const F = getLeadingWhitespace(matched[0]!);
-                const P = getLeadingWhitespace(hunk.oldLines[0]!);
-                if (line.startsWith(P)) {
-                  return F + line.slice(P.length);
+              const matched = currentLines.slice(pos, pos + hunk.oldLines.length);
+              const normalize = tier === 0 ? (s: string) => s : tier === 1 ? trimTrailing : trimLeadingTrailing;
+              
+              const newLinesWithContext = hunk.newLines.map((line, idx) => {
+                if (idx < hunk.oldLines.length && normalize(hunk.oldLines[idx]!) === normalize(line)) {
+                  return matched[idx]!;
                 }
-              }
+                
+                if (tier === 2 && line !== '' && line.trim() !== '') {
+                  const F = getLeadingWhitespace(matched[0]!);
+                  const P = getLeadingWhitespace(hunk.oldLines[0]!);
+                  if (line.startsWith(P)) {
+                    return F + line.slice(P.length);
+                  }
+                }
+                
+                return line;
+              });
 
-              return line;
-            });
-
-            currentLines.splice(pos, hunk.oldLines.length, ...newLinesWithContext);
-            d += newLinesWithContext.length - hunk.oldLines.length;
+              currentLines.splice(pos, hunk.oldLines.length, ...newLinesWithContext);
+              d += newLinesWithContext.length - hunk.oldLines.length;
+            }
           }
-        }
 
-        const finalText = currentLines.length === 0 ? '' : currentLines.join(br) + (hadFinalBreak ? br : '');
-        tree.now.set(newPath!, finalText);
-        tree.now.set(oldPath!, null);
-      });
+          // Check if any hunk says no final newline; if so, suppress it
+          const hasNoFinalNewline = hunks.some((h) => h.noFinalNewline);
+          const finalText = currentLines.length === 0 ? '' : currentLines.join(br) + (hasNoFinalNewline ? '' : (hadFinalBreak ? br : ''));
+          tree.now.set(newPath!, finalText);
+          tree.now.set(oldPath!, null);
+       });
     } else {
-      edits.push((tree) => {
-        const text = tree.get(path);
-        if (text === null) throw new Fail('missing', path);
+       edits.push((tree) => {
+          const text = tree.get(path);
+          if (text === null) throw new Fail('missing', path);
 
-        let currentLines = fileLines(text);
-        const br = fileLineBreak(text);
-        const hadFinalBreak = text === '' ? false : text.endsWith(br);
-        let d = 0;
+          let currentLines = fileLines(text);
+          const br = fileLineBreak(text);
+          const hadFinalBreak = text === '' ? false : text.endsWith(br);
+          let d = 0;
 
-        for (const hunk of hunks) {
-          if (hunk.oldLines.length === 0) {
-            const insertPos = Math.min(hunk.oldStart + 1 + d, currentLines.length);
-            currentLines.splice(insertPos, 0, ...hunk.newLines);
-            d += hunk.newLines.length;
-          } else {
-            const target = hunk.oldStart - 1 + d;
-            const matchResult = findMatchNearest(hunk.oldLines, currentLines, target, strict);
-            if (matchResult === null) throw new Fail('no-match', path);
+          for (const hunk of hunks) {
+            if (hunk.oldLines.length === 0) {
+              const insertPos = Math.min(hunk.oldStart + 1 + d, currentLines.length);
+              currentLines.splice(insertPos, 0, ...hunk.newLines);
+              d += hunk.newLines.length;
+            } else {
+              const target = hunk.oldStart - 1 + d;
+              const matchResult = findMatchNearest(hunk.oldLines, currentLines, target, strict);
+              if (matchResult === null) throw new Fail('no-match', path);
 
-            const pos = extractPos(matchResult);
-            const tier = extractTier(matchResult);
+              const pos = extractPos(matchResult);
+              const tier = extractTier(matchResult);
 
-            const matched = currentLines.slice(pos, pos + hunk.oldLines.length);
-            const normalize = tier === 0 ? (s: string) => s : tier === 1 ? trimTrailing : trimLeadingTrailing;
-
-            const newLinesWithContext = hunk.newLines.map((line, idx) => {
-              const isContextLine = idx < hunk.oldLines.length && hunk.oldLines[idx]! === line;
-              if (isContextLine) {
-                return matched[idx]!;
-              }
-
-              if (tier === 2 && line !== '' && line.trim() !== '') {
-                const F = getLeadingWhitespace(matched[0]!);
-                const P = getLeadingWhitespace(hunk.oldLines[0]!);
-                if (line.startsWith(P)) {
-                  return F + line.slice(P.length);
+              const matched = currentLines.slice(pos, pos + hunk.oldLines.length);
+              const normalize = tier === 0 ? (s: string) => s : tier === 1 ? trimTrailing : trimLeadingTrailing;
+              
+              const newLinesWithContext = hunk.newLines.map((line, idx) => {
+                if (idx < hunk.oldLines.length && normalize(hunk.oldLines[idx]!) === normalize(line)) {
+                  return matched[idx]!;
                 }
-              }
+                
+                if (tier === 2 && line !== '' && line.trim() !== '') {
+                  const F = getLeadingWhitespace(matched[0]!);
+                  const P = getLeadingWhitespace(hunk.oldLines[0]!);
+                  if (line.startsWith(P)) {
+                    return F + line.slice(P.length);
+                  }
+                }
+                
+                return line;
+              });
 
-              return line;
-            });
-
-            currentLines.splice(pos, hunk.oldLines.length, ...newLinesWithContext);
-            d += newLinesWithContext.length - hunk.oldLines.length;
+              currentLines.splice(pos, hunk.oldLines.length, ...newLinesWithContext);
+              d += newLinesWithContext.length - hunk.oldLines.length;
+            }
           }
-        }
 
-        const finalText = currentLines.length === 0 ? '' : currentLines.join(br) + (hadFinalBreak ? br : '');
-        tree.now.set(path, finalText);
-      });
-    }
+          // Check if any hunk says no final newline; if so, suppress it
+          const hasNoFinalNewline = hunks.some((h) => h.noFinalNewline);
+          const finalText = currentLines.length === 0 ? '' : currentLines.join(br) + (hasNoFinalNewline ? '' : (hadFinalBreak ? br : ''));
+          tree.now.set(path, finalText);
+        });
+     }
   }
 
-  return edits;
+  return { edits, moves };
 }
 
 function parseSearchReplace(lines: string[], strict: boolean): Edit[] {
   const edits: Edit[] = [];
   let currentPath: string | null = null;
   let i = 0;
-  let searchStartLine: number | null = null;
 
   while (i < lines.length) {
     if (blank(lines[i]!)) {
@@ -526,7 +567,6 @@ function parseSearchReplace(lines: string[], strict: boolean): Edit[] {
 
     if (line === '<<<<<<< SEARCH') {
       if (!currentPath) throw new Exit2(`error: parse ${i + 1}`);
-      searchStartLine = i;
 
       i++;
       const oldLines: string[] = [];
@@ -551,52 +591,52 @@ function parseSearchReplace(lines: string[], strict: boolean): Edit[] {
       }
       i++;
 
-      const path = currentPath;
-      edits.push((tree) => {
-        if (!safe(path)) throw new Fail('unsafe', path);
+       const path = currentPath;
+       edits.push((tree) => {
+         if (!safe(path)) throw new Fail('unsafe', path);
 
-        if (oldLines.length === 0) {
-          if (tree.get(path) !== null) throw new Fail('exists', path);
-          const br = '\n';
-          tree.now.set(path, newLines.length === 0 ? '' : newLines.join(br) + br);
-        } else {
-          const text = tree.get(path);
-          if (text === null) throw new Fail('missing', path);
+         if (oldLines.length === 0) {
+           if (tree.get(path) !== null) throw new Fail('exists', path);
+           const br = '\n';
+           tree.now.set(path, newLines.length === 0 ? '' : newLines.join(br) + br);
+         } else {
+           const text = tree.get(path);
+           if (text === null) throw new Fail('missing', path);
 
-          const currentFileLines = fileLines(text);
-          const br = fileLineBreak(text);
+           const currentFileLines = fileLines(text);
+           const br = fileLineBreak(text);
+           const hadFinalBreak = text === '' ? false : text.endsWith(br);
 
-          const result = findTierAndMatches(oldLines, currentFileLines, strict);
-          if (result === null) throw new Fail('no-match', path);
-          if (result.positions.length > 1) throw new Fail('ambiguous', path);
+           const result = findTierAndMatches(oldLines, currentFileLines, strict);
+           if (result === null) throw new Fail('no-match', path);
+           if (result.positions.length > 1) throw new Fail('ambiguous', path);
 
-          const tier = result.tier;
-          const pos = result.positions[0]!;
-          const matched = currentFileLines.slice(pos, pos + oldLines.length);
-          const normalize = tier === 0 ? (s: string) => s : tier === 1 ? trimTrailing : trimLeadingTrailing;
+           const tier = result.tier;
+           const pos = result.positions[0]!;
+           const matched = currentFileLines.slice(pos, pos + oldLines.length);
+           const normalize = tier === 0 ? (s: string) => s : tier === 1 ? trimTrailing : trimLeadingTrailing;
+           
+           const newLinesWithContext = newLines.map((line, idx) => {
+             if (idx < oldLines.length && normalize(oldLines[idx]!) === normalize(line)) {
+               return matched[idx]!;
+             }
+             
+             if (tier === 2 && line !== '' && line.trim() !== '') {
+               const F = getLeadingWhitespace(matched[0]!);
+               const P = getLeadingWhitespace(oldLines[0]!);
+               if (line.startsWith(P)) {
+                 return F + line.slice(P.length);
+               }
+             }
+             
+             return line;
+           });
 
-          const newLinesWithContext = newLines.map((line, idx) => {
-            const isContextLine = idx < oldLines.length && oldLines[idx]! === line;
-            if (isContextLine) {
-              return matched[idx]!;
-            }
-
-            if (tier === 2 && line !== '' && line.trim() !== '') {
-              const F = getLeadingWhitespace(matched[0]!);
-              const P = getLeadingWhitespace(oldLines[0]!);
-              if (line.startsWith(P)) {
-                return F + line.slice(P.length);
-              }
-            }
-
-            return line;
-          });
-
-          currentFileLines.splice(pos, oldLines.length, ...newLinesWithContext);
-          const finalText = currentFileLines.length === 0 ? '' : currentFileLines.join(br) + br;
-          tree.now.set(path, finalText);
-        }
-      });
+           currentFileLines.splice(pos, oldLines.length, ...newLinesWithContext);
+           const finalText = currentFileLines.length === 0 ? '' : currentFileLines.join(br) + (hadFinalBreak ? br : '');
+           tree.now.set(path, finalText);
+         }
+       });
     } else if (!line.startsWith('<<<<<<')) {
       currentPath = lines[i]!.trim();
       i++;
@@ -609,8 +649,9 @@ function parseSearchReplace(lines: string[], strict: boolean): Edit[] {
   return edits;
 }
 
-function parseV4A(lines: string[], strict: boolean): Edit[] {
+function parseV4A(lines: string[], strict: boolean): { edits: Edit[], moves: Map<string, string> } {
   const edits: Edit[] = [];
+  const moves = new Map<string, string>();
   let i = 0;
 
   while (i < lines.length && blank(lines[i]!)) i++;
@@ -621,9 +662,11 @@ function parseV4A(lines: string[], strict: boolean): Edit[] {
 
   while (i < lines.length && blank(lines[i]!)) i++;
 
+  let foundEndPatch = false;
   while (i < lines.length) {
     const l = lines[i]!.trim();
     if (l === '*** End Patch') {
+      foundEndPatch = true;
       i++;
       while (i < lines.length && blank(lines[i]!)) i++;
       if (i < lines.length) throw new Exit2(`error: parse ${i + 1}`);
@@ -670,7 +713,9 @@ function parseV4A(lines: string[], strict: boolean): Edit[] {
       let newPath: string | null = null;
       if (i < lines.length && lines[i]!.trim().startsWith('*** Move to: ')) {
         newPath = lines[i]!.trim().slice(13);
-        if (!safe(newPath)) throw new Fail('unsafe', newPath);
+        if (newPath) {
+          moves.set(path, newPath);
+        }
         i++;
       }
 
@@ -689,8 +734,8 @@ function parseV4A(lines: string[], strict: boolean): Edit[] {
               const prefix = body[0];
               if (prefix === ' ' || prefix === '-' || prefix === '+' || body === '') {
                 if (prefix === ' ') {
-                  oldLines.push(body.slice(1));
-                  newLines.push(body.slice(1));
+                  oldLines.push(trimTrailing(body.slice(1)));
+                  newLines.push(trimTrailing(body.slice(1)));
                 } else if (prefix === '-') {
                   oldLines.push(body.slice(1));
                 } else if (prefix === '+') {
@@ -720,8 +765,8 @@ function parseV4A(lines: string[], strict: boolean): Edit[] {
             const prefix = body[0];
             if (prefix === ' ' || prefix === '-' || prefix === '+' || body === '') {
               if (prefix === ' ') {
-                oldLines.push(body.slice(1));
-                newLines.push(body.slice(1));
+                oldLines.push(trimTrailing(body.slice(1)));
+                newLines.push(trimTrailing(body.slice(1)));
               } else if (prefix === '-') {
                 oldLines.push(body.slice(1));
               } else if (prefix === '+') {
@@ -748,8 +793,8 @@ function parseV4A(lines: string[], strict: boolean): Edit[] {
               const p = body[0];
               if (p === ' ' || p === '-' || p === '+' || body === '') {
                 if (p === ' ') {
-                  oldLines.push(body.slice(1));
-                  newLines.push(body.slice(1));
+                  oldLines.push(trimTrailing(body.slice(1)));
+                  newLines.push(trimTrailing(body.slice(1)));
                 } else if (p === '-') {
                   oldLines.push(body.slice(1));
                 } else if (p === '+') {
@@ -766,7 +811,7 @@ function parseV4A(lines: string[], strict: boolean): Edit[] {
             chunks.push({ anchor: null, oldLines, newLines });
             hasChunk = true;
           } else {
-            i++;
+            throw new Exit2(`error: parse ${i + 1}`);
           }
         }
       }
@@ -783,114 +828,113 @@ function parseV4A(lines: string[], strict: boolean): Edit[] {
         let cursor = 0;
 
         for (const chunk of chunks) {
-          if (chunk.anchor === 'EOF') {
-            if (chunk.oldLines.length === 0) {
-              currentLines.splice(currentLines.length, 0, ...chunk.newLines);
-            } else {
-              const result = findTierAndMatches(chunk.oldLines, currentLines, strict);
-              if (result === null) throw new Fail('no-match', path);
+           if (chunk.anchor === 'EOF') {
+             if (chunk.oldLines.length === 0) {
+               currentLines.splice(currentLines.length, 0, ...chunk.newLines);
+             } else {
+               const result = findTierAndMatches(chunk.oldLines, currentLines, strict);
+               if (result === null) throw new Fail('no-match', path);
+               
+               let eofPos: number | null = null;
+               for (const pos of result.positions) {
+                 if (pos + chunk.oldLines.length === currentLines.length) {
+                   eofPos = pos;
+                   break;
+                 }
+               }
+               
+               if (eofPos === null) throw new Fail('no-match', path);
+               
+               const tier = result.tier;
+               const matched = currentLines.slice(eofPos, eofPos + chunk.oldLines.length);
+               const normalize = tier === 0 ? (s: string) => s : tier === 1 ? trimTrailing : trimLeadingTrailing;
+               
+               const finalLines = chunk.newLines.map((line, idx) => {
+                 if (idx < chunk.oldLines.length && normalize(chunk.oldLines[idx]!) === normalize(line)) {
+                   return matched[idx]!;
+                 }
+                 
+                 if (tier === 2 && line !== '' && line.trim() !== '') {
+                   const F = getLeadingWhitespace(matched[0]!);
+                   const P = getLeadingWhitespace(chunk.oldLines[0]!);
+                   if (line.startsWith(P)) {
+                     return F + line.slice(P.length);
+                   }
+                 }
+                 
+                 return line;
+               });
 
-              let eofPos: number | null = null;
-              for (const pos of result.positions) {
-                if (pos + chunk.oldLines.length === currentLines.length) {
-                  eofPos = pos;
-                  break;
-                }
-              }
+               currentLines.splice(eofPos, chunk.oldLines.length, ...finalLines);
+               cursor = eofPos + finalLines.length;
+             }
+           } else if (chunk.anchor) {
+             const anchorResult = findTierAndMatches([chunk.anchor], currentLines, strict);
+             if (anchorResult === null) throw new Fail('no-match', path);
+             
+             let anchorPos: number | null = null;
+             for (const pos of anchorResult.positions) {
+               if (pos >= cursor) {
+                 anchorPos = pos;
+                 break;
+               }
+             }
+             
+             if (anchorPos === null) throw new Fail('no-match', path);
+             cursor = anchorPos + 1;
 
-              if (eofPos === null) throw new Fail('no-match', path);
+             if (chunk.oldLines.length === 0) {
+               currentLines.splice(cursor, 0, ...chunk.newLines);
+               cursor += chunk.newLines.length;
+             } else {
+               const matchResult = findMatchAfter(chunk.oldLines, currentLines, cursor, strict);
+               if (matchResult === null) throw new Fail('no-match', path);
 
-              const tier = result.tier;
-              const matched = currentLines.slice(eofPos, eofPos + chunk.oldLines.length);
-              const normalize = tier === 0 ? (s: string) => s : tier === 1 ? trimTrailing : trimLeadingTrailing;
+               const pos = extractPos(matchResult);
+               const tier = extractTier(matchResult);
+               const matched = currentLines.slice(pos, pos + chunk.oldLines.length);
+               let finalLines = [...chunk.newLines];
 
-              const finalLines = chunk.newLines.map((line, idx) => {
-                const isContextLine = idx < chunk.oldLines.length && chunk.oldLines[idx]! === line;
-                if (isContextLine) {
-                  return matched[idx]!;
-                }
+               if (tier === 2) {
+                 const F = getLeadingWhitespace(matched[0]!);
+                 const P = getLeadingWhitespace(chunk.oldLines[0]!);
+                 finalLines = finalLines.map((line) => {
+                   if (line === '' || line.trim() === '') return line;
+                   if (line.startsWith(P)) return F + line.slice(P.length);
+                   return line;
+                 });
+               }
 
-                if (tier === 2 && line !== '' && line.trim() !== '') {
-                  const F = getLeadingWhitespace(matched[0]!);
-                  const P = getLeadingWhitespace(chunk.oldLines[0]!);
-                  if (line.startsWith(P)) {
-                    return F + line.slice(P.length);
-                  }
-                }
+               currentLines.splice(pos, chunk.oldLines.length, ...finalLines);
+               cursor = pos + finalLines.length;
+             }
+           } else {
+             if (chunk.oldLines.length === 0) {
+               currentLines.splice(cursor, 0, ...chunk.newLines);
+               cursor += chunk.newLines.length;
+             } else {
+               const matchResult = findMatchAfter(chunk.oldLines, currentLines, cursor, strict);
+               if (matchResult === null) throw new Fail('no-match', path);
 
-                return line;
-              });
+               const pos = extractPos(matchResult);
+               const tier = extractTier(matchResult);
+               const matched = currentLines.slice(pos, pos + chunk.oldLines.length);
+               let finalLines = [...chunk.newLines];
 
-              currentLines.splice(eofPos, chunk.oldLines.length, ...finalLines);
-              cursor = eofPos + finalLines.length;
-            }
-          } else if (chunk.anchor) {
-            const anchorResult = findTierAndMatches([chunk.anchor], currentLines, strict);
-            if (anchorResult === null) throw new Fail('no-match', path);
+               if (tier === 2) {
+                 const F = getLeadingWhitespace(matched[0]!);
+                 const P = getLeadingWhitespace(chunk.oldLines[0]!);
+                 finalLines = finalLines.map((line) => {
+                   if (line === '' || line.trim() === '') return line;
+                   if (line.startsWith(P)) return F + line.slice(P.length);
+                   return line;
+                 });
+               }
 
-            let anchorPos: number | null = null;
-            for (const pos of anchorResult.positions) {
-              if (pos >= cursor) {
-                anchorPos = pos;
-                break;
-              }
-            }
-
-            if (anchorPos === null) throw new Fail('no-match', path);
-            cursor = anchorPos + 1;
-
-            if (chunk.oldLines.length === 0) {
-              currentLines.splice(cursor, 0, ...chunk.newLines);
-              cursor += chunk.newLines.length;
-            } else {
-              const matchResult = findMatchAfter(chunk.oldLines, currentLines, cursor, strict);
-              if (matchResult === null) throw new Fail('no-match', path);
-
-              const pos = extractPos(matchResult);
-              const tier = extractTier(matchResult);
-              const matched = currentLines.slice(pos, pos + chunk.oldLines.length);
-              let finalLines = [...chunk.newLines];
-
-              if (tier === 2) {
-                const F = getLeadingWhitespace(matched[0]!);
-                const P = getLeadingWhitespace(chunk.oldLines[0]!);
-                finalLines = finalLines.map((line) => {
-                  if (line === '' || line.trim() === '') return line;
-                  if (line.startsWith(P)) return F + line.slice(P.length);
-                  return line;
-                });
-              }
-
-              currentLines.splice(pos, chunk.oldLines.length, ...finalLines);
-              cursor = pos + finalLines.length;
-            }
-          } else {
-            if (chunk.oldLines.length === 0) {
-              currentLines.splice(cursor, 0, ...chunk.newLines);
-              cursor += chunk.newLines.length;
-            } else {
-              const matchResult = findMatchAfter(chunk.oldLines, currentLines, cursor, strict);
-              if (matchResult === null) throw new Fail('no-match', path);
-
-              const pos = extractPos(matchResult);
-              const tier = extractTier(matchResult);
-              const matched = currentLines.slice(pos, pos + chunk.oldLines.length);
-              let finalLines = [...chunk.newLines];
-
-              if (tier === 2) {
-                const F = getLeadingWhitespace(matched[0]!);
-                const P = getLeadingWhitespace(chunk.oldLines[0]!);
-                finalLines = finalLines.map((line) => {
-                  if (line === '' || line.trim() === '') return line;
-                  if (line.startsWith(P)) return F + line.slice(P.length);
-                  return line;
-                });
-              }
-
-              currentLines.splice(pos, chunk.oldLines.length, ...finalLines);
-              cursor = pos + finalLines.length;
-            }
-          }
+               currentLines.splice(pos, chunk.oldLines.length, ...finalLines);
+               cursor = pos + finalLines.length;
+             }
+           }
         }
 
         const finalText = currentLines.length === 0 ? '' : currentLines.join(br) + br;
@@ -908,8 +952,10 @@ function parseV4A(lines: string[], strict: boolean): Edit[] {
     while (i < lines.length && blank(lines[i]!)) i++;
   }
 
+  if (!foundEndPatch) throw new Exit2(`error: parse ${lines.length + 1}`);
+
   if (edits.length === 0) throw new Exit2('error: parse 1');
-  return edits;
+  return { edits, moves };
 }
 
 function run(args: string[]): { code: number; out: string[] } {
@@ -939,15 +985,20 @@ function run(args: string[]): { code: number; out: string[] } {
   const kind = format === null || format === 'auto' ? detect(lines) : format;
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
+  let moves = new Map<string, string>();
   try {
     if (kind === 'json') {
       edits = jsonEdits(text, lines);
     } else if (kind === 'unified') {
-      edits = parseUnifiedDiff(lines, strict);
+      const result = parseUnifiedDiff(lines, strict);
+      edits = result.edits;
+      moves = result.moves;
     } else if (kind === 'search-replace') {
       edits = parseSearchReplace(lines, strict);
     } else if (kind === 'v4a') {
-      edits = parseV4A(lines, strict);
+      const result = parseV4A(lines, strict);
+      edits = result.edits;
+      moves = result.moves;
     } else {
       edits = [];
     }
@@ -972,27 +1023,38 @@ function run(args: string[]): { code: number; out: string[] } {
   if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
   const rows: string[] = [];
   const renames = new Map<string, string>();
+  
+  // First pass: collect all changes and use explicit moves
+  for (const [oldPath, newPath] of moves) {
+    renames.set(newPath, oldPath);
+  }
+  
   for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
     const was = tree.original(p);
     const now = tree.now.get(p)!;
     if (was === now) continue;
-
-    if (was !== null && now === null) {
-      const newPath = [...tree.now.entries()].find(([newP, newV]) => newV === was && tree.original(newP) === null)?.[0];
-      if (newPath && !renames.has(newPath)) {
-        renames.set(newPath, p);
-        continue;
-      }
-    }
-
+    
+    // Check if this is a destination of an explicit move
     if (renames.has(p)) {
       const oldPath = renames.get(p)!;
       rows.push(`R ${oldPath} -> ${p}`);
       renames.delete(p);
+    } else if (was !== null && now === null) {
+      // Check if this deleted file is a source of an explicit move (shouldn't output it)
+      let isMovedFrom = false;
+      for (const [oldPath, newPath] of moves) {
+        if (oldPath === p) {
+          isMovedFrom = true;
+          break;
+        }
+      }
+      if (!isMovedFrom) {
+        rows.push(`D ${p}`);
+      }
     } else {
       rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
     }
-
+    
     if (check) continue;
     if (now === null) rmSync(p, { force: true });
     else {
